@@ -15,6 +15,7 @@ additional_compiler_profiles = [ { name = "via-ir", via_ir = true, optimizer = t
 
 # Enabling via-ir selectively to speed up compilation for project
 compilation_restrictions = [
+  { paths = "src/lens/UZRUnwindQuoter.sol", via_ir = true },
   { paths = "src/lending_market/LendingMarket.sol", via_ir = true },
   { paths = "src/sisu_vault/SisuVault.sol", via_ir = true },
   { paths = "src/sisu_vault/SisuVaultFactory.sol", via_ir = true },

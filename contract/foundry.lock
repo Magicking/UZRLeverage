@@ -1,20 +1,26 @@
 {
   "lib/forge-std": {
     "tag": {
-      "name": "v1.14.0",
-      "rev": "1801b0541f4fda118a10798fd3486bb7051c5dd6"
+      "name": "v1.16.2",
+      "rev": "bf647bd6046f2f7da30d0c2bf435e5c76a780c1b"
     }
   },
   "lib/openzeppelin-contracts": {
     "tag": {
-      "name": "v5.5.0",
-      "rev": "fcbae5394ae8ad52d8e580a3477db99814b9d565"
+      "name": "v5.6.1",
+      "rev": "5fd1781b1454fd1ef8e722282f86f9293cacf256"
     }
   },
   "lib/universal-router": {
     "tag": {
       "name": "v1.6.0",
       "rev": "41183d6eb154f0ab0e74a0e911a5ef9ea51fc4bd"
+    }
+  },
+  "lib/v4-core": {
+    "tag": {
+      "name": "v4.0.0",
+      "rev": "e50237c43811bd9b526eff40f26772152a42daba"
     }
   }
 }

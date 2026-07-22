@@ -141,51 +141,106 @@ lendingMarket.setAuthorization(address(leverageContract), true);
 leverageContract.leveragePosition(3);
 ```
 
-### 2. Unleverage Position
+### 2. Mint-Based Leverage (Flash)
 
-The `unleveragePosition` function systematically reduces leverage by repaying debt and withdrawing collateral.
+The `leverageFlashMint` function builds the position in a single transaction using the lending
+market's free flashloan and `Usd0PP.mint` (1 USD0 -> 1 bUSD0 + 1 rt-USD0 at par).
 
 #### Function Signature
 
 ```solidity
-function unleveragePosition(uint256 iterations) external
+function leverageFlashMint(uint256 borrowAmount) external
 ```
 
 #### Parameters
 
-- `iterations` (uint256): Number of deleverage iterations to perform (must be > 0)
+- `borrowAmount` (uint256): USD0 to flashloan and leave borrowed. The borrow reverts if it
+  violates the market LTV; sizing rule: `borrowAmount <= 0.87 * (equity + borrowAmount)`
+  (about 6.7x on equity).
 
 #### Execution Flow
 
-1. **Authorization Check**: Verifies the contract is authorized by the user
-2. **Iteration Loop**: For each iteration:
-   - Checks available USD0 balance in the contract
-   - Compares with user's debt position; caps USD0 used at debt amount minus 1 wei
-   - Repays debt using USD0
-   - Calculates collateral to withdraw: `debtRepaid * 100 / 88` (inverse of LTV)
-   - Withdraws collateral from the lending market
-   - Swaps withdrawn BUSD0 for USD0 on Uniswap
-   - Continues with the newly acquired USD0
+1. Flashloans `borrowAmount` USD0 from the lending market (free)
+2. Mints `equity + borrowAmount` bUSD0 (to the contract) + rt-USD0 (**to the user's wallet**)
+3. Supplies all bUSD0 as collateral, borrows `borrowAmount` USD0 to repay the flashloan
+
+#### Trade-off vs `leveragePosition`
+
+- Pool-buy loop: bUSD0 bought at the market discount (more collateral per USD0), but the
+  discount is paid back with slippage when selling on close.
+- Mint route: par entry (less collateral per USD0), but the rt-USD0 stockpile lets
+  `unleverageFlash` later exit the same amount at par via `reconstruct` — the full round trip
+  pays no pool fee or slippage.
+- Reverts after bond maturity (`Usd0PP.mint` guard).
+
+### 3. Unleverage Position (Flash Unwind)
+
+The `unleverageFlash` function unwinds the position — fully or partially — in a single
+transaction: flashloan USD0, repay debt, withdraw collateral, convert bUSD0 back to USD0, and
+send the proceeds to the user.
+
+#### Function Signature
+
+```solidity
+function unleverageFlash(uint256 repayAssets, uint256 rtAmount, bool useFloorExit, uint256 minUsd0Out) external
+```
+
+#### Parameters
+
+- `repayAssets` (uint256): USD0 debt to repay. Pass `type(uint256).max` (or any value >= debt)
+  for a full close — it repays by shares and leaves zero debt dust.
+- `rtAmount` (uint256): Max rt-USD0 to pull from the user for the par leg. Only
+  `min(rtAmount, withdrawn collateral)` is pulled; the excess never leaves the user's wallet.
+- `useFloorExit` (bool): If true, dispose of the remainder via `unlockUsd0ppFloorPrice`
+  instead of the pool. Quote both legs with `UZRUnwindQuoter` and pick the better one.
+- `minUsd0Out` (uint256): Minimum total USD0 sent to the user. Protects against pool slippage
+  and manipulation — always set it from a quote.
+
+#### Execution Flow
+
+1. **Authorization Check** + `accrueInterest` so the debt read is exact
+2. Flashloans the repay amount of USD0 from the lending market (free, repaid in the same tx)
+3. Repays debt (by shares on full close; exact assets on partial)
+4. Withdraws collateral: all of it on full close; on partial, an interest-aware amount that
+   keeps the remaining position at the same 1% buffer under the market LTV
+5. **Par leg**: pulls up to `rtAmount` rt-USD0 from the user and calls
+   `Usd0PP.reconstruct(bUSD0 + rt-USD0 -> USD0)` — par, no fee, no slippage
+6. **Remainder leg**: sells any remaining bUSD0 either directly on the V3 pool or via the
+   Usd0PP floor price (`useFloorExit`)
+7. The market pulls the flashloan repayment; all remaining USD0 goes to the user
+
+#### Why reconstruct
+
+bUSD0 trades below par on the pool (~0.965 at the time of writing). Selling a levered
+position's full collateral at that discount costs a large share of user equity. `reconstruct`
+redeems 1 bUSD0 + 1 rt-USD0 for exactly 1 USD0, so every unit of rt-USD0 the user holds
+converts that unit of the unwind from a discounted market sale into a par redemption.
 
 #### Technical Details
 
-- **Debt Cap**: If contract USD0 balance exceeds debt, uses `debt - 1` to avoid over-repayment
-- **Collateral Calculation**: Assumes 88% LTV relationship: `collateral = debt / 0.88`
-- **Slippage Protection**: Swaps use 10% minimum output protection (`amountInValue * 900 / 1000`) based on oracle price
-- **Swap Path**: `BUSD0 -> USD0` through Uniswap V3 pool with 0.01% fee tier
-- **Early Termination**: Stops if USD0 balance falls below 1e18 wei
+- **Full close**: repay-by-shares clears the debt exactly (the old iterative path left 1 wei)
+- **Partial close**: withdrawal is computed from live debt (interest-aware), replacing the old
+  hardcoded `100/88`
+- **rt-USD0 approvals**: the user must `rtUsd0.approve(leverageContract, amount)` before
+  passing `rtAmount > 0`
+- **Usd0PP paused**: `reconstruct` reverts; retry with `rtAmount = 0`
+- **Flashloan liquidity**: positions larger than the market's flashloanable USD0 must be
+  unwound in partial chunks (`repayAssets` < debt, repeated)
 
 #### Example Usage
 
 ```solidity
-// Transfer USD0 to the contract to repay debt
-IERC20(usd0).transfer(address(leverageContract), amount);
+// Quote first (off-chain, via UZRUnwindQuoter)
+UZRUnwindQuoter.UnwindQuote memory q = quoter.quoteUnleverage(user, type(uint256).max, rtBalance);
 
-// Execute 5 deleverage iterations
-leverageContract.unleveragePosition(5);
+// Approve rt-USD0 for the par leg
+rtUsd0.approve(address(leverageContract), rtBalance);
+
+// Full close, pool exit, minOut from the quote
+leverageContract.unleverageFlash(type(uint256).max, rtBalance, q.preferFloor, q.expectedUsd0Out * 995 / 1000);
 ```
 
-### 3. User Management
+### 4. User Management
 
 The contract implements a two-step user change process for security.
 
@@ -223,7 +278,7 @@ vm.prank(NEW_USER);
 leverageContract.confirmChangeUser();
 ```
 
-### 4. Emergency Withdraw
+### 5. Emergency Withdraw
 
 Allows the user to withdraw any remaining tokens from the contract.
 
@@ -252,7 +307,7 @@ leverageContract.emergencyWithdraw(address(busd0), 0);
 leverageContract.emergencyWithdraw(address(usd0), 100e18);
 ```
 
-### 5. Pool Fee Getter
+### 6. Pool Fee Getter
 
 ```solidity
 function poolFee() external pure returns (uint24)
@@ -267,8 +322,15 @@ Before using the contract, users must complete the following:
 ### 1. Transfer Tokens to Contract
 
 The contract needs tokens to operate. Users should transfer either:
-- **BUSD0**: For leverage operations
-- **USD0**: For unleverage operations or initial swap
+- **BUSD0** or **USD0**: For `leveragePosition`
+- **USD0**: The equity for `leverageFlashMint`
+
+`unleverageFlash` needs no upfront transfer — the flashloan seeds the repayment. For the par
+leg, the user instead approves rt-USD0:
+
+```solidity
+IERC20(rtUsd0).approve(address(leverageContract), rtAmount);
+```
 
 ```solidity
 // Transfer BUSD0 to contract
@@ -288,7 +350,7 @@ The contract must be authorized to manage positions on behalf of the user:
 lendingMarket.setAuthorization(address(leverageContract), true);
 ```
 
-**Critical**: This authorization is checked at the beginning of `leveragePosition` and `unleveragePosition` functions. Operations will revert if not authorized.
+**Critical**: This authorization is checked at the beginning of `leveragePosition`, `leverageFlashMint`, and `unleverageFlash`. Operations will revert if not authorized.
 
 ## Technical Implementation Details
 
@@ -303,15 +365,17 @@ lendingMarket.setAuthorization(address(leverageContract), true);
 - **Recipient**: Contract address
 - **Deadline**: `block.timestamp + 300` (5 minutes)
 
-#### Unleverage Swap (BUSD0 -> USD0)
+#### Unwind Conversion (BUSD0 -> USD0)
 
-- **Command**: `V3_SWAP_EXACT_IN`
-- **Path**: `BUSD0 (20 bytes) + POOL_FEE (3 bytes) + USD0 (20 bytes)`
-- **Price Calculation**: Uses oracle price to determine expected USD0 output
-- **Minimum Output**: `(amountIn * oraclePrice / ORACLE_PRICE_SCALE) * 900 / 1000` (10% slippage tolerance)
-- **Payer**: Contract itself (via Permit2)
-- **Recipient**: Contract address
-- **Deadline**: `block.timestamp + 300` (5 minutes)
+- **Par leg**: `Usd0PP.reconstruct(amount, address(this))` burns bUSD0 + the user's rt-USD0
+  1:1 and releases USD0 at par — no pool, no fee, no slippage. No approvals needed (bUSD0 is
+  self-burned; rt-USD0 burning is role-gated to Usd0PP, not allowance-based).
+- **Remainder leg (pool)**: direct `pool.swap` on the bUSD0/USD0 V3 pool (fee 100), exact
+  input, paid in the `uniswapV3SwapCallback`.
+- **Remainder leg (floor)**: `Usd0PP.unlockUsd0ppFloorPrice(amount)` redeems at the floor
+  price (<= 1e18) when that beats the pool execution price.
+- **Slippage Protection**: a single `minUsd0Out` check on the total user proceeds, quoted
+  off-chain via `UZRUnwindQuoter` (replaces the old per-swap 10% oracle tolerance).
 
 ### Borrow Calculation
 
@@ -327,27 +391,31 @@ The 1e16 subtraction (1%) provides a safety buffer to prevent potential edge cas
 
 ### Withdrawal Calculation
 
-During unleverage iterations, the collateral withdrawal amount is calculated as:
+On a full close the entire collateral is withdrawn after the shares-based repay. On a partial
+unwind the released amount is interest-aware:
 
 ```solidity
-assetsToBeWithdrawn = debtRepaid * 100 / 88;
+requiredCollateral = borrowAfter.wDivUp(marketParams.ltv - 1e16).mulDivUp(ORACLE_PRICE_SCALE, oracle.price());
+withdrawn = collateral - requiredCollateral;
 ```
 
-This assumes the position was created with 88% LTV, allowing withdrawal of the full collateral backing the repaid debt.
+This keeps the remaining position at the same 1% buffer under the market LTV that
+`leveragePosition` borrows at, instead of the old hardcoded `debtRepaid * 100 / 88`.
 
 ## Security Considerations
 
 ### Access Control
 
-- **User-Only Functions**: `leveragePosition`, `unleveragePosition`, `emergencyWithdraw`, and `changeUser` can only be called by the current user
+- **User-Only Functions**: `leveragePosition`, `leverageFlashMint`, `unleverageFlash`, `emergencyWithdraw`, and `changeUser` can only be called by the current user
 - **Authorization Checks**: Leverage/unleverage operations verify lending market authorization before execution
+- **Callback Guards**: `onFlashLoan` (lending market only) and `uniswapV3SwapCallback` (pool only) additionally require a live flow started by this contract (transient `_inFlash` flag), so unsolicited callbacks revert
 - **Two-Step User Change**: Prevents unauthorized user changes
 
 ### Slippage Protection
 
 - **Leverage Swaps**: 0.5% minimum output protection
-- **Unleverage Swaps**: 10% minimum output protection (more conservative due to oracle-based calculation)
-- **Transaction Deadlines**: All swaps include 5-minute deadline to prevent stale transactions
+- **Unwind**: single `minUsd0Out` check on total proceeds, quoted via `UZRUnwindQuoter`; the par (reconstruct) leg has no slippage by construction
+- **Transaction Deadlines**: Universal Router swaps include a 5-minute deadline
 
 ### Token Safety
 
@@ -382,7 +450,8 @@ The contract includes comprehensive fork tests that verify:
 
 - `test_ContractDeployment`: Verifies all contract state variables
 - `testFuzz_LeverageIterations`: Fuzz tests leverage with 1-1000 iterations
-- `testFuzz_UnleverageIterations`: Fuzz tests unleverage with 1-1000 iterations
+- `testFuzz_UnleverageFlash`: Builds a position and fully unwinds it in one flash transaction
+- `UZRLeverageFlashUnwindFork.t.sol`: dedicated suite for `unleverageFlash` / `leverageFlashMint` — par/partial/no-rt unwinds, floor exit, partial unwind fuzz, quoter-vs-execution, callback guards
 - `testFuzz_LeverageIterationTwice`: Tests sequential leverage calls
 - `test_ChangeUser`: Tests user change workflow
 - `test_CheckPrerequisites`: Validates setup requirements
@@ -420,9 +489,9 @@ lendingMarket.setAuthorization(address(leverage), true);
 // 4. Execute leverage
 leverage.leveragePosition(5);
 
-// 5. Later, when ready to deleverage
-IERC20(usd0).transfer(address(leverage), repaymentAmount);
-leverage.unleveragePosition(5);
+// 5. Later, when ready to deleverage: approve rt-USD0 (if held) and unwind in one tx
+IERC20(rtUsd0).approve(address(leverage), rtBalance);
+leverage.unleverageFlash(type(uint256).max, rtBalance, false, minUsd0Out);
 
 // 6. Withdraw remaining tokens if needed
 leverage.emergencyWithdraw(address(busd0), 0);

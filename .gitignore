@@ -1,7 +1,6 @@
 # Compiler files
 cache/
 out/
-contract/lib
 contract/node_modules
 /node_modules
 

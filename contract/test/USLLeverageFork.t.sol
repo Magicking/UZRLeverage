@@ -285,7 +285,7 @@ contract UZRLeverageForkTest is Test {
         balanceleverageContractBUSD0 = busd0.balanceOf(address(leverageContract));
     }
 
-    function testFuzz_UnleverageIterations(uint8 iterations) public {
+    function testFuzz_UnleverageFlash(uint8 iterations) public {
         // Limit iterations to prevent gas issues
         iterations = uint8(bound(iterations, 1, 1000));
 
@@ -307,11 +307,9 @@ contract UZRLeverageForkTest is Test {
         assertGt(userPositionBorrowSharesBefore, 0);
         assertGt(userPositionCollateralAssetsBefore, 0);
 
-        deal(USD0, USER, 100e18); // Deal 100 USD0 to USER
-        vm.startPrank(USER);
-        usd0.transfer(address(leverageContract), usd0.balanceOf(USER));
-        leverageContract.unleveragePosition(iterations);
-        vm.stopPrank();
+        // Single-tx flashloan unwind, no rt-USD0, pool exit
+        vm.prank(USER);
+        leverageContract.unleverageFlash(type(uint256).max, 0, false, 0);
         (
             uint256 userPositionSupplyAssetsAfter,
             uint256 userPositionSupplySharesAfter,
@@ -321,9 +319,9 @@ contract UZRLeverageForkTest is Test {
         ) = lendingMarket.getUserPosition(marketParams, USER);
         assertEq(userPositionSupplyAssetsAfter, 0);
         assertEq(userPositionSupplySharesAfter, 0);
-        assertEq(userPositionBorrowAssetsAfter, 1);
-        assertLt(userPositionBorrowSharesAfter, 100);
-        assertLt(userPositionCollateralAssetsAfter, userPositionCollateralAssetsBefore);
+        assertEq(userPositionBorrowAssetsAfter, 0);
+        assertEq(userPositionBorrowSharesAfter, 0);
+        assertEq(userPositionCollateralAssetsAfter, 0);
     }
 
     // Helper function to check prerequisites

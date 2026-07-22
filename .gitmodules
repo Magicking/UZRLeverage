@@ -7,3 +7,15 @@
 [submodule "lib/universal-router"]
 	path = contract/lib/universal-router
 	url = https://github.com/Uniswap/universal-router
+[submodule "contract/lib/forge-std"]
+	path = contract/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
+[submodule "contract/lib/openzeppelin-contracts"]
+	path = contract/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
+[submodule "contract/lib/universal-router"]
+	path = contract/lib/universal-router
+	url = https://github.com/Uniswap/universal-router
+[submodule "contract/lib/v4-core"]
+	path = contract/lib/v4-core
+	url = https://github.com/uniswap/v4-core

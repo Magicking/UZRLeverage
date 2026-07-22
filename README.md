@@ -37,9 +37,11 @@ firaleverage/
 ### Smart Contract (`contract/src/UZRLeverage.sol`)
 
 The core contract that handles leverage operations:
-- **Leverage**: Recursively supplies collateral, borrows at 88% LTV, and swaps USD0→BUSD0
-- **Unleverage**: Repays debt, withdraws collateral, and swaps BUSD0→USD0
-- **Integration**: Uses Uniswap Universal Router V4 for token swaps via Permit2
+- **Leverage (pool route)**: Recursively supplies collateral, borrows at 88% LTV, and swaps USD0→BUSD0
+- **Leverage (mint route)**: `leverageFlashMint` — single-tx flashloan + `Usd0PP.mint` at par; the rt-USD0 leg goes to the user's wallet for a later par exit
+- **Unleverage**: `unleverageFlash` — single-tx flashloan unwind: repay debt (by shares on full close), withdraw collateral, then convert BUSD0→USD0 at par via `Usd0PP.reconstruct` (bUSD0 + rt-USD0 → USD0) for up to the user's rt-USD0, selling only the remainder on the pool or at the Usd0PP floor price
+- **Quoter**: `UZRUnwindQuoter` lens simulates the pool leg (vendored V3 swap simulator) to compute `minUsd0Out` and pick the better remainder exit
+- **Integration**: Uses Uniswap Universal Router V4 for leverage swaps via Permit2, direct pool swaps for the unwind, and the UZR lending market's free flashloan
 
 ### Frontend (`frontend/`)
 
@@ -53,10 +55,12 @@ A Next.js web application with:
 ## Features
 
 - ✅ Recursive leverage operations with configurable iterations
-- ✅ Recursive deleverage operations
+- ✅ Single-transaction flashloan deleverage (full or partial, zero debt dust)
+- ✅ Par exits via bUSD0 + rt-USD0 reconstruction (no pool fee/slippage on the rt-covered part)
+- ✅ Mint-based leverage that stockpiles rt-USD0 for pool-friction-free round trips
 - ✅ Automatic token swaps via Uniswap V4
 - ✅ Real-time position tracking and balances
-- ✅ Slippage protection on swaps
+- ✅ Slippage protection on swaps (quoted `minUsd0Out` on unwind)
 - ✅ User-friendly web interface with futuristic dark theme
 - ✅ Contract authorization management
 
