@@ -21,7 +21,6 @@ abstract contract UZRPositionSimulationBase is Test {
 
     // Public gateway also used by the sibling usual-rt-arb repo's fork tests
     string constant RPC_URL = "https://mainnet.gateway.tenderly.co/49LPuZlg4TTIBIZohMSsqL";
-    uint256 constant FORK_BLOCK = 25544764;
 
     address constant UZR_LENDING_MARKET = 0xa428723eE8ffD87088C36121d72100B43F11fb6A;
     address constant BUSD0 = 0x35D8949372D46B7a3D5A56006AE77B215fc69bC0;
@@ -51,7 +50,7 @@ abstract contract UZRPositionSimulationBase is Test {
     function _target() internal pure virtual returns (address);
 
     function setUp() public {
-        vm.createSelectFork(RPC_URL, FORK_BLOCK);
+        vm.createSelectFork(RPC_URL);
 
         target = _target();
         vm.label(target, "TargetUser");
@@ -89,7 +88,7 @@ abstract contract UZRPositionSimulationBase is Test {
         rtBefore = rtUsd0.balanceOf(target);
         usd0Before = usd0.balanceOf(target);
 
-        console.log("=== Position at fork block", FORK_BLOCK, "===");
+        console.log("=== Position at fork block", block.number, "===");
         console.log("address              :", target);
         console.log("collateral (bUSD0)   :", _fmt(collateral));
         console.log("debt (USD0)          :", _fmt(debt));
