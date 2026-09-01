@@ -623,6 +623,55 @@ sequenceDiagram
     end
 ```
 
+## rt-USD0 Liquidity & Sourcing
+
+The par/reconstruct leg (`unleverageFlash` Route 4, `leverageFlashMint`) depends on the user
+holding rt-USD0. On-chain checks against the live token (`0x82DCA22b48B14DE38ccf83B03330120c4b8acFe9`,
+`rt-bUSD0`) as of block ~25,883,866:
+
+### Supply & holders
+
+| Metric | Value |
+|---|---|
+| rt-USD0 total supply | 329,732.54 |
+| rt-USD0 holders | 52 addresses |
+| bUSD0 total supply (companion token, same mint) | 523,344,094.76 |
+| rt-USD0 as % of bUSD0 supply | ~0.063% |
+| USD0 total supply (capital pool for fresh mints) | 549,082,815.74 |
+| Bond maturity (`Usd0PP.getEndTime()`) | ~649 days out (~21 months) at time of check |
+| `Usd0PP.paused()` | `false` |
+
+Only 0.063% of all outstanding bUSD0 has a live rt-USD0 counterpart — most bUSD0 in circulation
+was minted before this rt leg existed or has since had its rt-USD0 reconstructed/burned back.
+
+### DEX liquidity: none
+
+Checked Uniswap V3 `factory.getPool()` exhaustively — RTUSD0/USD0, RTUSD0/BUSD0, RTUSD0/WETH,
+across all four standard fee tiers (100/500/3000/10000): **every result is the zero address.**
+No pool exists on any pair, any fee tier. Etherscan corroborates independently: no DEX pairs
+listed, no price feed, no market cap. 66 `Transfer` events over the trailing ~50k blocks
+(~7 days) show mint-then-forward between two recurring addresses — protocol-internal routing,
+not organic secondary-market trades.
+
+### Buy strategy: mint, not TWAP
+
+TWAP / limit-order / DCA framing doesn't apply — there is nothing to trade into. The only
+acquisition path is `Usd0PP.mint(amountUsd0, bRecipient, rRecipient)`:
+
+- **Fixed 1:1 par**, any size: 1 USD0 in → 1 bUSD0 + 1 rt-USD0 out. No price impact, no
+  slippage — it's a protocol-level bond split, not an AMM trade, so there's no curve to walk
+  down and no benefit to splitting a mint into tranches for price reasons (only for gas
+  amortization or hedging against `paused()` flipping mid-sequence).
+- **Cost is 100% capital**, not fees: sourcing `N` rt-USD0 permanently locks `N` USD0 (until
+  `reconstruct` or bond maturity) and jointly mints `N` bUSD0 that needs a home (collateral
+  supply, or a sink per `_giveTargetRt` in the test suite).
+- **OTC sourcing from the 52 existing holders isn't realistic at any real size.** The whale
+  position from the unwind comparison above (86,080 bUSD0 collateral) would need 86,080
+  rt-USD0 for a full par exit — ~26% of the *entire* circulating supply. Minting is the only
+  viable route, and it's actually favorable versus a market buy: guaranteed par, zero execution
+  risk, bounded only by the user's own USD0 and the ~21-month maturity window, not by market
+  depth — because there is no market depth to be bounded by.
+
 ## Prerequisites
 
 Before using the contract, users must complete the following:
