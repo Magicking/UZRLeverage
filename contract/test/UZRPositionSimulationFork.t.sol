@@ -109,6 +109,27 @@ abstract contract UZRPositionSimulationBase is Test {
         vm.stopPrank();
     }
 
+    /// @dev Legacy `unleveragePosition` needs a small USD0 seed transferred into the contract to
+    ///      bootstrap the first repay; each loop then sells the freed collateral back into USD0
+    ///      to fund the next. Withdrawn collateral and swap proceeds stay in the contract between
+    ///      loops, so any dust left after the loop must be swept out with `emergencyWithdraw`.
+    ///      Measuring the delta from `usd0Before` (pre-seed) nets the seed out automatically.
+    uint256 constant LEGACY_SEED = 1_000e18;
+    uint256 constant LEGACY_ITERATIONS = 50;
+
+    function _runLegacyUnleverage() internal returns (uint256 proceeds) {
+        deal(USD0, target, usd0.balanceOf(target) + LEGACY_SEED);
+        vm.startPrank(target);
+        usd0.transfer(address(leverageContract), LEGACY_SEED);
+        leverageContract.unleveragePosition(LEGACY_ITERATIONS);
+        uint256 dust = usd0.balanceOf(address(leverageContract));
+        if (dust > 0) {
+            leverageContract.emergencyWithdraw(USD0, 0);
+        }
+        vm.stopPrank();
+        proceeds = usd0.balanceOf(target) - usd0Before;
+    }
+
     function _logOutcome(string memory route, uint256 proceeds) internal view {
         uint256 parEquity = collateral - debt;
         console.log("---", route, "---");
@@ -122,6 +143,22 @@ abstract contract UZRPositionSimulationBase is Test {
     /// @dev Integer USD with 2 decimals, e.g. 1115402 = 11154.02
     function _fmt(uint256 wad) internal pure returns (uint256) {
         return wad / 1e16;
+    }
+
+    function test_Unwind_LegacyIterative() public {
+        uint256 proceeds = _runLegacyUnleverage();
+
+        (,, uint256 debtAfter,, uint256 collateralAfter) = lendingMarket.getUserPosition(marketParams, target);
+        // Unlike unleverageFlash (repays by shares, exact zero-dust close), the legacy loop sizes
+        // each withdrawal off a flat 88% ratio and re-derives its next chunk from whatever USD0
+        // the swap produced. It stalls once that chunk drops to <=1e18 and stops making progress
+        // well before the position is closed — confirmed empirically: 50 vs 300 iterations left
+        // the identical remainder, so it's a structural stall, not an iteration-count shortfall.
+        console.log("debt left open (USD0)       :", _fmt(debtAfter));
+        console.log("collateral left open (bUSD0) :", _fmt(collateralAfter));
+        assertLt(debtAfter, debt, "legacy loop makes some progress on debt");
+        assertLt(collateralAfter, collateral, "legacy loop makes some progress on collateral");
+        _logOutcome("LEGACY ITERATIVE (unleveragePosition, N txs, stalls before full close)", proceeds);
     }
 
     function test_Unwind_PoolExit() public {
@@ -175,25 +212,30 @@ abstract contract UZRPositionSimulationBase is Test {
         _logOutcome("PAR EXIT (reconstruct with rt-USD0)", proceeds);
     }
 
-    /// @notice The headline comparison: same position, three routes, side by side.
+    /// @notice The headline comparison: same position, four routes, side by side.
     function test_Unwind_CompareAllRoutes() public {
         uint256 parEquity = collateral - debt;
 
-        // 1) pool exit
+        // 1) legacy iterative (pre-flashloan unleveragePosition, seeded + swept)
         uint256 snap = vm.snapshotState();
+        uint256 legacyProceeds = _runLegacyUnleverage();
+        vm.revertToState(snap);
+
+        // 2) pool exit
+        snap = vm.snapshotState();
         vm.prank(target);
         leverageContract.unleverageFlash(type(uint256).max, 0, false, 0);
         uint256 poolProceeds = usd0.balanceOf(target) - usd0Before;
         vm.revertToState(snap);
 
-        // 2) floor exit
+        // 3) floor exit
         snap = vm.snapshotState();
         vm.prank(target);
         leverageContract.unleverageFlash(type(uint256).max, 0, true, 0);
         uint256 floorProceeds = usd0.balanceOf(target) - usd0Before;
         vm.revertToState(snap);
 
-        // 3) par exit (target sources rt = collateral)
+        // 4) par exit (target sources rt = collateral)
         _giveTargetRt(collateral);
         uint256 usd0Start = usd0.balanceOf(target);
         vm.prank(target);
@@ -203,16 +245,20 @@ abstract contract UZRPositionSimulationBase is Test {
         console.log("");
         console.log("=== UNWIND COMPARISON (USD0, 2 decimals as integer) ===");
         console.log("par equity (theoretical max) :", _fmt(parEquity));
-        console.log("1. pool exit proceeds        :", _fmt(poolProceeds));
-        console.log("2. floor exit proceeds       :", _fmt(floorProceeds));
-        console.log("3. par (reconstruct) proceeds:", _fmt(parProceeds));
+        console.log("1. legacy iterative proceeds :", _fmt(legacyProceeds));
+        console.log("2. pool exit proceeds        :", _fmt(poolProceeds));
+        console.log("3. floor exit proceeds       :", _fmt(floorProceeds));
+        console.log("4. par (reconstruct) proceeds:", _fmt(parProceeds));
         console.log("");
         console.log("=== GAIN OF RECONSTRUCT ROUTE ===");
+        console.log("vs legacy iterative (USD0)   :", _fmt(parProceeds - legacyProceeds));
+        console.log("vs legacy iterative (bps)    :", ((parProceeds - legacyProceeds) * 10000) / parEquity);
         console.log("vs pool exit (USD0)          :", _fmt(parProceeds - poolProceeds));
         console.log("vs pool exit (bps of equity) :", ((parProceeds - poolProceeds) * 10000) / parEquity);
         console.log("vs floor exit (USD0)         :", _fmt(parProceeds - floorProceeds));
         console.log("vs floor exit (bps of equity):", ((parProceeds - floorProceeds) * 10000) / parEquity);
 
+        assertGt(parProceeds, legacyProceeds, "reconstruct beats legacy iterative");
         assertGt(parProceeds, poolProceeds, "reconstruct beats pool");
         assertGt(parProceeds, floorProceeds, "reconstruct beats floor");
         assertApproxEqAbs(parProceeds, parEquity, 2, "reconstruct is par");

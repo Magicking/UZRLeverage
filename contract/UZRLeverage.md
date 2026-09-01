@@ -173,6 +173,27 @@ function leverageFlashMint(uint256 borrowAmount) external
   pays no pool fee or slippage.
 - Reverts after bond maturity (`Usd0PP.mint` guard).
 
+### Legacy Iterative Unleverage (`unleveragePosition`)
+
+Pre-flashloan unwind path, kept in the contract as a comparison baseline against
+`unleverageFlash`. Needs an upfront USD0 seed transferred into the contract; each loop repays
+debt from the contract's current USD0 balance, withdraws collateral at a flat `100/88` ratio,
+and sells it back to USD0 on the pool via the Universal Router — the proceeds fund the next loop.
+
+```solidity
+function unleveragePosition(uint256 iterations) external
+```
+
+- `iterations` (uint256): loop count (must be > 0)
+
+**Confirmed by fork test** (`test_Unwind_LegacyIterative`, `UZRPositionSimulationFork.t.sol`):
+against two real on-chain positions, the loop clears debt to zero but **stalls with collateral
+still stranded** in the position — ~11% of collateral left open on an 86k bUSD0 position, ~40%
+on a 27k bUSD0 position, identical remainder whether capped at 50 or 300 iterations (a structural
+stall, not an iteration-count shortfall). Proceeds also land ~22–25% of equity short of the
+`unleverageFlash` par/reconstruct route on the same positions. No `minUsd0Out`, no floor-price
+option, and requires manually sweeping any leftover contract balance via `emergencyWithdraw`.
+
 ### 3. Unleverage Position (Flash Unwind)
 
 The `unleverageFlash` function unwinds the position — fully or partially — in a single
@@ -314,6 +335,293 @@ function poolFee() external pure returns (uint24)
 ```
 
 Returns the Uniswap pool fee tier (100 = 0.01%).
+
+## Flow Diagram
+
+Every route the contract supports, build side and unwind side, laid out separately so each can
+be traced against its function above.
+
+```mermaid
+flowchart TD
+    Start([User has equity: USD0 or bUSD0]) --> RouteChoice{Which build route?}
+
+    %% ---- Route 1: leveragePosition ----
+    RouteChoice -->|"Route A: leveragePosition(n)"| A1[Swap any existing USD0 → bUSD0]
+    A1 --> A2["Loop up to n times:\nsupply bUSD0 as collateral\n→ borrow 87% of value\n→ swap USD0→bUSD0 on V3 pool"]
+    A2 --> A3["Stop early if bUSD0 balance ≤ 1e18"]
+    A3 --> AEnd(["Position open\ncollateral bought at pool discount\nno rt-USD0"])
+
+    %% ---- Route 2: leverageFlashMint ----
+    RouteChoice -->|"Route B: leverageFlashMint(borrowAmount)"| B1["Flashloan borrowAmount USD0\n(free, single tx)"]
+    B1 --> B2["Usd0PP.mint(equity + borrowAmount)\n→ bUSD0 to contract\n→ rt-USD0 to USER wallet"]
+    B2 --> B3["Supply all bUSD0 as collateral\nborrow flashAmount, repay flashloan"]
+    B3 --> BEnd(["Position open\ncollateral minted at par\nuser holds rt-USD0 for later par exit"])
+
+    AEnd -.-> Unwind
+    BEnd -.-> Unwind
+
+    Unwind([Ready to unwind]) --> UChoice{Which unwind route?}
+
+    %% ---- Route 1: legacy iterative ----
+    UChoice -->|"Route 1: unleveragePosition(n) — legacy"| L1["User seeds contract with USD0\n(bootstrap capital)"]
+    L1 --> L2["Loop up to n times:\nrepay debt from contract USD0 balance\n→ withdraw collateral at flat 100/88 ratio\n→ swap bUSD0→USD0 via Universal Router"]
+    L2 --> L3["⚠ Stalls before full close\n(confirmed by fork test, not iteration-limited)"]
+    L3 --> L4["Debt reaches 0\nbut bUSD0 collateral left stranded\n(~11%–40% of position, observed)"]
+    L4 --> L5["Manual emergencyWithdraw needed\nto sweep contract's USD0 dust to user"]
+    L5 --> UEnd
+
+    %% ---- unleverageFlash: shared setup for routes 2-4 ----
+    UChoice -->|"Routes 2–4: unleverageFlash(...)"| F1["Flashloan repayAssets USD0\n(free, single tx)"]
+    F1 --> F2["Repay debt\n(by shares if full close → zero dust)"]
+    F2 --> F3["Withdraw collateral\n(all on full close, interest-aware on partial)"]
+    F3 --> RtChoice{"rtAmount > 0?"}
+
+    %% ---- Route 4: par exit (reconstruct leg) ----
+    RtChoice -->|yes| R1["Pull min(rtAmount, withdrawn) rt-USD0 from user"]
+    R1 --> R2["Usd0PP.reconstruct(bUSD0 + rt-USD0 → USD0)\npar, zero fee, zero slippage"]
+    R2 --> Remainder{"bUSD0 remainder\nafter reconstruct?"}
+    RtChoice -->|no| Remainder
+
+    %% ---- Route 2 vs Route 3: pool vs floor for the remainder ----
+    Remainder -->|"none — fully covered by rt-USD0"| ParFull(["Route 4: PAR EXIT\nfull par, 0 loss vs equity"])
+    Remainder -->|"some left, useFloorExit=false"| P1["Route 2: POOL EXIT\nsell remainder on V3 pool\n(exact-in swap, market discount)"]
+    Remainder -->|"some left, useFloorExit=true"| Fl1["Route 3: FLOOR EXIT\nUsd0PP.unlockUsd0ppFloorPrice(remainder)"]
+
+    P1 --> F9["Flashloan repaid, proceeds sent to user\nrequire(proceeds >= minUsd0Out)"]
+    Fl1 --> F9
+    ParFull --> F9
+    F9 --> UEnd(["Position closed\nUSD0 in user wallet"])
+```
+
+**Measured outcome per route** (two real on-chain positions, `UZRPositionSimulationFork.t.sol`,
+`forge test --match-path "test/UZR*.sol" -vv`):
+
+| Route | 86k bUSD0 position | 27k bUSD0 position | Notes |
+|---|---|---|---|
+| 1. Legacy iterative | $8,321.62 | $3,213.27 | debt→0 but collateral stranded, N txs |
+| 2. Pool exit (flash) | $8,215.63 | $3,254.07 | single tx, market discount on remainder |
+| 3. Floor exit (flash) | $4,258.08 | $2,016.37 | single tx, floor price usually worse here |
+| 4. Par/reconstruct (flash) | **$11,144.50** | **$4,153.20** | single tx, needs rt-USD0, zero loss vs par equity |
+
+### Sequence Diagrams
+
+Same six routes, shown as actor-to-actor call sequences. `Router` = Uniswap Universal Router
+(Permit2 path), `Pool` = the bUSD0/USD0 V3 pool called directly (`uniswapV3SwapCallback`).
+
+#### Route A — `leveragePosition` (recursive pool-buy loop)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant C as UZRLeverage
+    participant M as LendingMarket
+    participant R as Router (Permit2)
+
+    User->>M: setAuthorization(C, true)
+    User->>C: transfer bUSD0/USD0 equity
+    User->>C: leveragePosition(n)
+    loop up to n iterations
+        C->>M: supplyCollateral(bUSD0)
+        C->>M: borrow(87% of value)
+        M-->>C: USD0
+        C->>R: V3_SWAP_EXACT_IN USD0→bUSD0
+        R-->>C: bUSD0
+    end
+    Note over C: stops early if bUSD0 balance ≤ 1e18
+```
+
+#### Route B — `leverageFlashMint` (single-tx mint at par)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant C as UZRLeverage
+    participant M as LendingMarket
+    participant P as Usd0PP (bUSD0)
+
+    User->>M: setAuthorization(C, true)
+    User->>C: transfer USD0 equity
+    User->>C: leverageFlashMint(borrowAmount)
+    C->>M: flashLoan(USD0, borrowAmount)
+    M-->>C: USD0 (borrowAmount)
+    C->>M: onFlashLoan(assets, OP_LEVERAGE_MINT)
+    C->>P: mint(equity + borrowAmount, receiver=C, rtReceiver=User)
+    P-->>C: bUSD0
+    P-->>User: rt-USD0 (stockpiled for later par exit)
+    C->>M: supplyCollateral(bUSD0)
+    C->>M: borrow(borrowAmount)
+    M-->>C: USD0
+    M->>C: pull flashloan repayment (transferFrom)
+    C-->>User: sweep any USD0 dust
+```
+
+#### Route 1 — `unleveragePosition` (legacy iterative, no flashloan)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant C as UZRLeverage
+    participant M as LendingMarket
+    participant R as Router (Permit2)
+
+    User->>C: transfer USD0 seed (bootstrap capital)
+    User->>C: unleveragePosition(n)
+    loop up to n iterations
+        C->>M: repay(current USD0 balance)
+        M-->>C: debtRepaid
+        C->>M: withdrawCollateral(debtRepaid * 100/88)
+        M-->>C: bUSD0
+        C->>R: V3_SWAP_EXACT_IN bUSD0→USD0
+        R-->>C: USD0 (funds next loop)
+    end
+    Note over C,M: ⚠ debt reaches 0 but loop stalls —<br/>bUSD0 collateral left stranded in the position
+    User->>C: emergencyWithdraw(USD0, 0)
+    C-->>User: sweep leftover USD0 balance
+```
+
+#### Routes 2–4 — `unleverageFlash` (pool exit / floor exit / par reconstruct)
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant C as UZRLeverage
+    participant M as LendingMarket
+    participant P as Usd0PP (bUSD0)
+    participant Pool as V3 Pool
+
+    User->>C: rtUsd0.approve(C, rtAmount)   %% only needed for the par leg
+    User->>C: unleverageFlash(repayAssets, rtAmount, useFloorExit, minUsd0Out)
+    C->>M: accrueInterest(marketParams)
+    C->>M: flashLoan(USD0, flashAmount)
+    M-->>C: USD0
+    C->>M: onFlashLoan(assets, OP_UNLEVERAGE)
+    alt full close
+        C->>M: repay(shares=all)  %% zero debt dust
+    else partial close
+        C->>M: repay(assets=repayAssets)
+    end
+    C->>M: withdrawCollateral(withdrawn)
+    M-->>C: bUSD0
+
+    opt rtAmount > 0
+        C->>User: pull rt-USD0 (transferFrom, min(rtAmount, withdrawn))
+        C->>P: reconstruct(rtUse) — Route 4 leg
+        P-->>C: USD0 at par, zero fee/slippage
+    end
+
+    alt bUSD0 remainder AND useFloorExit
+        C->>P: unlockUsd0ppFloorPrice(remainder) — Route 3
+        P-->>C: USD0 at floor price
+    else bUSD0 remainder AND NOT useFloorExit
+        C->>Pool: swap(remainder, exact-in) — Route 2
+        Pool->>C: uniswapV3SwapCallback (pay owed leg)
+        C-->>Pool: transfer owed token
+        Pool-->>C: USD0
+    end
+
+    M->>C: pull flashloan repayment (transferFrom)
+    C->>C: require(proceeds >= minUsd0Out)
+    C-->>User: transfer total USD0 proceeds
+```
+
+#### All Routes — Combined
+
+Every entry point on one timeline: build side picks Route A or B, unwind side picks Route 1
+(legacy) or `unleverageFlash`, which then branches again into Routes 2/3/4 for the remainder.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant C as UZRLeverage
+    participant M as LendingMarket
+    participant R as Router (Permit2)
+    participant P as Usd0PP (bUSD0)
+    participant Pool as V3 Pool
+
+    User->>M: setAuthorization(C, true)
+
+    rect rgb(235, 245, 255)
+    Note over User,R: BUILD — pick one
+    alt Route A: leveragePosition(n)
+        User->>C: transfer bUSD0/USD0 equity
+        User->>C: leveragePosition(n)
+        loop up to n iterations
+            C->>M: supplyCollateral(bUSD0)
+            C->>M: borrow(87% of value)
+            M-->>C: USD0
+            C->>R: swap USD0→bUSD0
+            R-->>C: bUSD0
+        end
+        Note over C: stops early if bUSD0 balance ≤ 1e18
+    else Route B: leverageFlashMint(borrowAmount)
+        User->>C: transfer USD0 equity
+        User->>C: leverageFlashMint(borrowAmount)
+        C->>M: flashLoan(USD0, borrowAmount)
+        M-->>C: USD0
+        C->>P: mint(equity + borrowAmount, C, User)
+        P-->>C: bUSD0
+        P-->>User: rt-USD0 (stockpiled)
+        C->>M: supplyCollateral(bUSD0)
+        C->>M: borrow(borrowAmount)
+        M-->>C: USD0
+        M->>C: pull flashloan repayment
+        C-->>User: sweep USD0 dust
+    end
+    end
+
+    Note over User,Pool: ... time passes, position accrues interest ...
+
+    rect rgb(255, 243, 224)
+    Note over User,Pool: UNWIND — pick one
+    alt Route 1: unleveragePosition(n) — legacy
+        User->>C: transfer USD0 seed
+        User->>C: unleveragePosition(n)
+        loop up to n iterations
+            C->>M: repay(contract USD0 balance)
+            M-->>C: debtRepaid
+            C->>M: withdrawCollateral(debtRepaid * 100/88)
+            M-->>C: bUSD0
+            C->>R: swap bUSD0→USD0
+            R-->>C: USD0
+        end
+        Note over C,M: ⚠ stalls — debt→0 but bUSD0 left stranded
+        User->>C: emergencyWithdraw(USD0, 0)
+        C-->>User: sweep leftover USD0
+    else Routes 2–4: unleverageFlash(repayAssets, rtAmount, useFloorExit, minUsd0Out)
+        opt rtAmount > 0
+        User->>C: rtUsd0.approve(C, rtAmount)
+        end
+        User->>C: unleverageFlash(...)
+        C->>M: accrueInterest(marketParams)
+        C->>M: flashLoan(USD0, flashAmount)
+        M-->>C: USD0
+        alt full close
+            C->>M: repay(shares=all)
+        else partial close
+            C->>M: repay(assets=repayAssets)
+        end
+        C->>M: withdrawCollateral(withdrawn)
+        M-->>C: bUSD0
+        opt rtAmount > 0
+            C->>User: pull rt-USD0 (min(rtAmount, withdrawn))
+            C->>P: reconstruct(rtUse) — Route 4
+            P-->>C: USD0 at par
+        end
+        alt bUSD0 remainder AND useFloorExit
+            C->>P: unlockUsd0ppFloorPrice(remainder) — Route 3
+            P-->>C: USD0 at floor price
+        else bUSD0 remainder AND NOT useFloorExit
+            C->>Pool: swap(remainder, exact-in) — Route 2
+            Pool->>C: uniswapV3SwapCallback
+            C-->>Pool: transfer owed token
+            Pool-->>C: USD0
+        end
+        M->>C: pull flashloan repayment
+        C->>C: require(proceeds >= minUsd0Out)
+        C-->>User: transfer total USD0 proceeds
+    end
+    end
+```
 
 ## Prerequisites
 

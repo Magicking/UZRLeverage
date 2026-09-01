@@ -204,6 +204,50 @@ contract UZRLeverage {
         }
     }
 
+    /// @notice Legacy iterative unwind: repay debt / withdraw collateral / pool-swap remainder,
+    ///         one loop per iteration, no flashloan. Kept as a comparison baseline against
+    ///         `unleverageFlash` — same pool-sale economics, but N transactions instead of one,
+    ///         and no par/reconstruct or floor-price option.
+    /// @param iterations Number of repay/withdraw/swap iterations to perform
+    function unleveragePosition(uint256 iterations) external {
+        require(msg.sender == user, "UZRLeverage: only user can call this function");
+        require(iterations > 0, "UZRLeverage: iterations must be > 0");
+
+        // Check authorization
+        require(lendingMarket.isAuthorized(user, address(this)), "UZRLeverage: contract not authorized");
+        uint256 usd0Balance;
+        // Perform leverage iterations
+        for (uint256 i = 0; i < iterations; i++) {
+            // Get new balance after swap for next iteration
+            usd0Balance = usd0.balanceOf(address(this));
+            (,, uint256 borrowAssets,,) = lendingMarket.getUserPosition(marketParams, user);
+
+            if (usd0Balance > borrowAssets) {
+                usd0Balance = borrowAssets - 1;
+            }
+            if (usd0Balance <= 1e18) break; // Stop debt repayment if no more USD0
+            _unleveragePosition(usd0Balance);
+        }
+    }
+
+    /// @notice unleverage position: repay debt, withdraw collateral, swap
+    function _unleveragePosition(uint256 debtAmount) internal {
+        // get user debt position on this market
+        // 1. Repay debt (requires authorization)
+        (uint256 debtRepaid,) = lendingMarket.repay(marketParams, debtAmount, 0, user, hex"");
+        // knowing that the debt was repaid, we can withdraw the collateral
+        // the debt is 88% of the collateral, so we can withdraw 100% of the collateral
+        uint256 assetsToBeWithdrawn = debtRepaid.mulDivDown(100, 88);
+        // 2. Withdraw collateral
+        lendingMarket.withdrawCollateral(marketParams, assetsToBeWithdrawn, user, address(this));
+
+        // 3. Swap BUSD0 for USD0 on Uniswap
+        uint256 busd0Balance = busd0.balanceOf(address(this));
+        if (busd0Balance > 0) {
+            _swapBusd0ToUsd0(busd0Balance);
+        }
+    }
+
     /// @notice Lending market flashloan callback. The market transfers the loan before calling
     ///         this and pulls the repayment via transferFrom after it returns (the constructor's
     ///         USD0 approval covers the pull).
@@ -344,6 +388,27 @@ contract UZRLeverage {
 
         // Execute the swap with 5 minute deadline
         // The router will use Permit2 to pull USD0 from this contract
+        _universalRouter.execute(commands, inputs, block.timestamp + 300);
+    }
+
+    /// @notice Swaps BUSD0 for USD0 on Uniswap Universal Router using Permit2
+    /// @dev Legacy swap leg used only by `unleveragePosition`; `unleverageFlash` sells its
+    ///      remainder directly on the V3 pool via `uniswapV3SwapCallback` instead.
+    function _swapBusd0ToUsd0(uint256 amountIn) internal {
+        require(amountIn > 0, "UZRLeverage: zero swap amount");
+        uint256 balance = busd0.balanceOf(address(this));
+        require(balance >= amountIn, "UZRLeverage: insufficient BUSD0 balance");
+
+        bytes memory path = abi.encodePacked(address(busd0), _POOL_FEE, address(usd0));
+        // divide the amountIn by the Busd0/USD0 price to get the right expected amount out
+
+        uint256 collateralPrice = oracle.price();
+        uint256 amountInValueInCollateral = amountIn.mulDivDown(collateralPrice, ORACLE_PRICE_SCALE);
+        bytes memory input =
+            abi.encode(address(this), amountIn, amountInValueInCollateral.mulDivDown(900, 1000), path, true);
+        bytes memory commands = abi.encodePacked(uint8(Commands.V3_SWAP_EXACT_IN));
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = input;
         _universalRouter.execute(commands, inputs, block.timestamp + 300);
     }
 
