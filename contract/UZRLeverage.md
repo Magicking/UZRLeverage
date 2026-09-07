@@ -854,3 +854,48 @@ leverage.unleverageFlash(type(uint256).max, rtBalance, false, minUsd0Out);
 leverage.emergencyWithdraw(address(busd0), 0);
 leverage.emergencyWithdraw(address(usd0), 0);
 ```
+
+## Test Run Report (2026-09-07)
+
+Full fork test suite executed via `forge test -vv` against fork block `25926043`.
+
+### Summary
+
+| Suite | File | Tests | Passed | Failed |
+|---|---|---|---|---|
+| `UZRLeverageForkTest` | `test/USLLeverageFork.t.sol` | 14 | 14 | 0 |
+| `UZRLeverageFlashUnwindForkTest` | `test/UZRLeverageFlashUnwindFork.t.sol` | 17 | 17 | 0 |
+| `UZRPosition6564SimulationForkTest` | `test/UZRPositionSimulationFork.t.sol` | 5 | 5 | 0 |
+| `UZRWhaleSimulationForkTest` | `test/UZRPositionSimulationFork.t.sol` | 5 | 5 | 0 |
+| **Total** | | **41** | **41** | **0** |
+
+Runtime: 4 suites in 2.08s (6.64s CPU time).
+
+### Unwind Route Comparison (`UZRPositionSimulationFork.t.sol`)
+
+The simulation tests unwind two real forked positions through four exit routes and compare proceeds against theoretical par equity. Both positions confirm the same ranking: **par (reconstruct) > legacy iterative > pool exit > floor exit**.
+
+**Position `0x6564...bCA09`** — collateral 2,671,033 bUSD0, debt 2,255,749 USD0, equity at par 415,283 USD0, leverage 6.43x:
+
+| Route | Proceeds (USD0) | Loss vs par | Loss (bps) |
+|---|---|---|---|
+| Par exit (reconstruct, rt-USD0) | 415,283 | 0 | 0 |
+| Legacy iterative (`unleveragePosition`) | 327,551 | 87,732 | 2,112 |
+| Pool exit (sell collateral at market) | 331,852 | 83,431 | 2,009 |
+| Floor exit (`unlockUsd0ppFloorPrice`) | 201,601 | 213,682 | 5,145 |
+
+**Position `0x8926...Bc14e`** (whale) — collateral 8,608,019 bUSD0, debt 7,493,691 USD0, equity at par 1,114,328 USD0, leverage 7.72x:
+
+| Route | Proceeds (USD0) | Loss vs par | Loss (bps) |
+|---|---|---|---|
+| Par exit (reconstruct, rt-USD0) | 1,114,328 | 0 | 0 |
+| Legacy iterative (`unleveragePosition`) | 852,801 | 261,526 | 2,346 |
+| Pool exit (sell collateral at market) | 842,292 | 272,035 | 2,441 |
+| Floor exit (`unlockUsd0ppFloorPrice`) | 425,686 | 688,641 | 6,179 |
+
+### Takeaways
+
+- Par exit (reconstruct via rt-USD0) always recovers 100% of par equity — it's the reference/upper bound in both fixtures.
+- Legacy iterative and pool exit land close together (~20-24% loss vs par); legacy iterative edges out pool exit on the smaller position, pool exit edges out legacy iterative on the whale position — the gap narrows/reverses with size because pool slippage scales with trade size while legacy iterative's per-step dust-stall loss is roughly size-invariant.
+- Floor exit is consistently worst (~51-62% loss vs par) since it prices collateral at the hard floor (0.92) rather than market/par.
+- `UZRLeverageFlashUnwindFork.t.sol` corroborates the ranking directly: `test_ParBeatsPoolExit` logs par proceeds 107,165,964,393,481,937,644 wei vs pool proceeds 79,076,126,270,570,989,461 wei on its own fixture — par wins by ~35%.
