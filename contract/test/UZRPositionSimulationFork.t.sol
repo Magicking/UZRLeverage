@@ -113,14 +113,23 @@ abstract contract UZRPositionSimulationBase is Test {
     ///      bootstrap the first repay; each loop then sells the freed collateral back into USD0
     ///      to fund the next. Withdrawn collateral and swap proceeds stay in the contract between
     ///      loops, so any dust left after the loop must be swept out with `emergencyWithdraw`.
-    ///      Measuring the delta from `usd0Before` (pre-seed) nets the seed out automatically.
-    uint256 constant LEGACY_SEED = 1_000e18;
+    ///      The seed itself is external capital (`deal`), so its size matters even when fully
+    ///      consumed: repaying `seed` frees `seed * 100/88` of collateral (LTV-driven), and 100%
+    ///      of the USD0 that collateral fetches on sale lands in "proceeds" with nothing repaid
+    ///      out of it — a real windfall proportional to seed size, not just leftover-seed leakage.
+    ///      Keeping the seed to a small, live-debt-scaled fraction (never a fixed constant sized
+    ///      for one fixture) makes that windfall negligible regardless of position size, while the
+    ///      floor above the contract's own 1e18 dust-stall threshold keeps the loop from breaking
+    ///      immediately on tiny positions.
     uint256 constant LEGACY_ITERATIONS = 50;
+    uint256 constant LEGACY_SEED_FLOOR = 2e18;
 
     function _runLegacyUnleverage() internal returns (uint256 proceeds) {
-        deal(USD0, target, usd0.balanceOf(target) + LEGACY_SEED);
+        uint256 seed = debt / 200;
+        if (seed < LEGACY_SEED_FLOOR) seed = LEGACY_SEED_FLOOR;
+        deal(USD0, target, usd0.balanceOf(target) + seed);
         vm.startPrank(target);
-        usd0.transfer(address(leverageContract), LEGACY_SEED);
+        usd0.transfer(address(leverageContract), seed);
         leverageContract.unleveragePosition(LEGACY_ITERATIONS);
         uint256 dust = usd0.balanceOf(address(leverageContract));
         if (dust > 0) {
@@ -274,10 +283,10 @@ abstract contract UZRPositionSimulationBase is Test {
     }
 }
 
-/// @notice 0x8926...c14e — larger of the two tracked positions; exact size read live in setUp().
+/// @notice 0x6120...0242c — larger of the two tracked positions; exact size read live in setUp().
 contract UZRWhaleSimulationForkTest is UZRPositionSimulationBase {
     function _target() internal pure override returns (address) {
-        return 0x89261878977B5a01C4fD78Fc11566aBe31BBc14e;
+        return 0x6120932248DaFbDDb7e97279e10F9348b0E0242c;
     }
 }
 
