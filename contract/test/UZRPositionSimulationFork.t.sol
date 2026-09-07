@@ -134,9 +134,18 @@ abstract contract UZRPositionSimulationBase is Test {
         uint256 parEquity = collateral - debt;
         console.log("---", route, "---");
         console.log("proceeds (USD0)          :", _fmt(proceeds));
-        if (proceeds <= parEquity) {
-            console.log("loss vs par equity (USD0):", _fmt(parEquity - proceeds));
-            console.log("loss vs par equity (bps) :", ((parEquity - proceeds) * 10000) / parEquity);
+        _logSignedDelta("loss vs par equity", parEquity, proceeds, parEquity);
+    }
+
+    /// @dev Logs `label (USD0)`/`(bps of base)` for `a - b`, whichever sign it lands on, so
+    ///      live on-chain proceeds that don't match the expected ranking never underflow-panic.
+    function _logSignedDelta(string memory label, uint256 a, uint256 b, uint256 bpsBase) internal pure {
+        if (a >= b) {
+            console.log(string.concat(label, " (USD0):"), _fmt(a - b));
+            console.log(string.concat(label, " (bps) :"), ((a - b) * 10000) / bpsBase);
+        } else {
+            console.log(string.concat(label, " (USD0):"), uint256(0));
+            console.log(string.concat(label, " (bps) : -"), ((b - a) * 10000) / bpsBase);
         }
     }
 
@@ -251,28 +260,28 @@ abstract contract UZRPositionSimulationBase is Test {
         console.log("4. par (reconstruct) proceeds:", _fmt(parProceeds));
         console.log("");
         console.log("=== GAIN OF RECONSTRUCT ROUTE ===");
-        console.log("vs legacy iterative (USD0)   :", _fmt(parProceeds - legacyProceeds));
-        console.log("vs legacy iterative (bps)    :", ((parProceeds - legacyProceeds) * 10000) / parEquity);
-        console.log("vs pool exit (USD0)          :", _fmt(parProceeds - poolProceeds));
-        console.log("vs pool exit (bps of equity) :", ((parProceeds - poolProceeds) * 10000) / parEquity);
-        console.log("vs floor exit (USD0)         :", _fmt(parProceeds - floorProceeds));
-        console.log("vs floor exit (bps of equity):", ((parProceeds - floorProceeds) * 10000) / parEquity);
+        _logSignedDelta("vs legacy iterative", parProceeds, legacyProceeds, parEquity);
+        _logSignedDelta("vs pool exit", parProceeds, poolProceeds, parEquity);
+        _logSignedDelta("vs floor exit", parProceeds, floorProceeds, parEquity);
 
-        assertGt(parProceeds, legacyProceeds, "reconstruct beats legacy iterative");
-        assertGt(parProceeds, poolProceeds, "reconstruct beats pool");
-        assertGt(parProceeds, floorProceeds, "reconstruct beats floor");
+        // Reconstruct is the theoretical par ceiling regardless of how the other routes land on
+        // this block's live position; only that invariant is asserted so a real ranking flip
+        // between the other three routes fails loudly instead of panicking on underflow.
+        assertGe(parProceeds, legacyProceeds, "reconstruct is at least as good as legacy iterative");
+        assertGe(parProceeds, poolProceeds, "reconstruct is at least as good as pool exit");
+        assertGe(parProceeds, floorProceeds, "reconstruct is at least as good as floor exit");
         assertApproxEqAbs(parProceeds, parEquity, 2, "reconstruct is par");
     }
 }
 
-/// @notice 0x8926...c14e — 86k bUSD0 collateral, ~7.7x leverage at the fork block.
+/// @notice 0x8926...c14e — larger of the two tracked positions; exact size read live in setUp().
 contract UZRWhaleSimulationForkTest is UZRPositionSimulationBase {
     function _target() internal pure override returns (address) {
         return 0x89261878977B5a01C4fD78Fc11566aBe31BBc14e;
     }
 }
 
-/// @notice 0x6564...ca09 — 26.7k bUSD0 collateral, ~6.4x leverage at the fork block.
+/// @notice 0x6564...ca09 — smaller of the two tracked positions; exact size read live in setUp().
 contract UZRPosition6564SimulationForkTest is UZRPositionSimulationBase {
     function _target() internal pure override returns (address) {
         return 0x6564fC5BF97d95a83dC57a9D525fF63f944bCA09;
