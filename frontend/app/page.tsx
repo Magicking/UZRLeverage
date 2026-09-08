@@ -9,6 +9,10 @@ import { UserPosition } from "@/components/UserPosition";
 import { AuthorizeContract } from "@/components/AuthorizeContract";
 import { ContractBalances } from "@/components/ContractBalances";
 import { TransferUSD0 } from "@/components/TransferUSD0";
+import { NewFlows } from "@/components/NewFlows";
+import { RpcSettings } from "@/components/RpcSettings";
+import { LeverageFlashMintControl } from "@/components/LeverageFlashMintControl";
+import { UnleverageFlashControl } from "@/components/UnleverageFlashControl";
 
 export default function Home() {
   const [contractAddress, setContractAddress] = useState<
@@ -69,6 +73,14 @@ export default function Home() {
           <p className="text-gray-400 text-lg">
             Leverage and deleverage positions on UZR Lending Market
           </p>
+        </div>
+
+        {/* Contract Flows */}
+        <NewFlows />
+
+        {/* RPC Settings */}
+        <div className="mb-8">
+          <RpcSettings />
         </div>
 
         {/* Contract Address Input */}
@@ -142,7 +154,16 @@ export default function Home() {
           <UserPosition contractAddress={contractAddress} />
         </div>
 
-        {/* Leverage Controls */}
+        {/* Flash Controls (new flows) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+          <LeverageFlashMintControl contractAddress={contractAddress} />
+          <UnleverageFlashControl contractAddress={contractAddress} />
+        </div>
+
+        {/* Legacy Iterative Controls */}
+        <div className="mb-4 text-center">
+          <p className="text-gray-500 text-sm uppercase tracking-wide">Legacy Iterative Flows</p>
+        </div>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           <LeverageControl contractAddress={contractAddress} />
           <UnleverageControl contractAddress={contractAddress} />
