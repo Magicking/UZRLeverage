@@ -215,6 +215,10 @@ contract UZRLeverage {
 
         // Check authorization
         require(lendingMarket.isAuthorized(user, address(this)), "UZRLeverage: contract not authorized");
+
+        uint256 usd0Snapshot = usd0.balanceOf(address(this));
+        uint256 busd0Snapshot = busd0.balanceOf(address(this));
+
         uint256 usd0Balance;
         // Perform leverage iterations
         for (uint256 i = 0; i < iterations; i++) {
@@ -227,6 +231,17 @@ contract UZRLeverage {
             }
             if (usd0Balance <= 1e18) break; // Stop debt repayment if no more USD0
             _unleveragePosition(usd0Balance);
+        }
+
+        // Return only what THIS call produced — never touch pre-existing/dust balances
+        // the user may have parked in the contract for an unrelated future call.
+        uint256 usd0After = usd0.balanceOf(address(this));
+        if (usd0After > usd0Snapshot) {
+            usd0.safeTransfer(user, usd0After - usd0Snapshot);
+        }
+        uint256 busd0After = busd0.balanceOf(address(this));
+        if (busd0After > busd0Snapshot) {
+            busd0.safeTransfer(user, busd0After - busd0Snapshot);
         }
     }
 

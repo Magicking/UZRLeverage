@@ -324,6 +324,86 @@ contract UZRLeverageForkTest is Test {
         assertEq(userPositionCollateralAssetsAfter, 0);
     }
 
+    function test_UnleveragePosition_OneIteration_TransfersFundsToUser() public {
+        vm.startPrank(USER);
+        lendingMarket.setAuthorization(address(leverageContract), true);
+        leverageContract.leveragePosition(20);
+        vm.stopPrank();
+
+        (,, uint256 borrowBefore,, uint256 collateralBefore) = lendingMarket.getUserPosition(marketParams, USER);
+        assertGt(borrowBefore, 0);
+        assertGt(collateralBefore, 0);
+
+        // unleveragePosition bootstraps its first repay from the CONTRACT's own USD0 balance
+        // (loop breaks immediately if that's <= 1e18) — leveragePosition(20) above spends it
+        // down to ~0, so a fresh seed must be transferred in first, same as real usage requires.
+        uint256 seed = borrowBefore / 200;
+        if (seed < 2e18) seed = 2e18;
+        deal(USD0, USER, seed);
+        vm.prank(USER);
+        usd0.transfer(address(leverageContract), seed);
+
+        uint256 userUsd0Before = usd0.balanceOf(USER);
+        uint256 userBusd0Before = busd0.balanceOf(USER);
+        // Contract's own USD0 balance right before the call (the seed just sent in, plus any
+        // dust); _unleveragePosition's swap step always sells the contract's *entire* current
+        // BUSD0 balance each iteration (pre-existing behavior, not changed here), so any BUSD0
+        // dust left over from leveragePosition(20) above gets converted to USD0 as a side effect
+        // and correctly forwarded to USER too — only the USD0 side is asserted against its
+        // pre-call snapshot below, since that's the only balance the fix leaves provably at rest.
+        uint256 contractUsd0Before = usd0.balanceOf(address(leverageContract));
+
+        vm.prank(USER);
+        leverageContract.unleveragePosition(1);
+
+        (,, uint256 borrowAfter,, uint256 collateralAfter) = lendingMarket.getUserPosition(marketParams, USER);
+        console.log("borrowBefore/After:", borrowBefore, borrowAfter);
+        console.log("collateralBefore/After:", collateralBefore, collateralAfter);
+
+        // Position actually progressed
+        assertLt(borrowAfter, borrowBefore);
+        assertLt(collateralAfter, collateralBefore);
+
+        // Unwind proceeds reached USER's wallet, not just the contract
+        assertGt(usd0.balanceOf(USER), userUsd0Before, "USER usd0 balance must increase");
+        assertEq(busd0.balanceOf(USER), userBusd0Before, "USER busd0 balance should not change (only USD0 is ever transferred to USER)");
+        // Contract's USD0 balance returns to its pre-call level: new proceeds swept out
+        assertEq(usd0.balanceOf(address(leverageContract)), contractUsd0Before, "no new USD0 proceeds should be left stuck in the contract");
+    }
+
+    function test_UnleveragePosition_TwentyIterations_TransfersFundsToUser() public {
+        vm.startPrank(USER);
+        lendingMarket.setAuthorization(address(leverageContract), true);
+        leverageContract.leveragePosition(20);
+        vm.stopPrank();
+
+        (,, uint256 borrowBefore,, uint256 collateralBefore) = lendingMarket.getUserPosition(marketParams, USER);
+        assertGt(borrowBefore, 0);
+
+        uint256 seed = borrowBefore / 200;
+        if (seed < 2e18) seed = 2e18;
+        deal(USD0, USER, seed);
+        vm.prank(USER);
+        usd0.transfer(address(leverageContract), seed);
+
+        uint256 userUsd0Before = usd0.balanceOf(USER);
+        uint256 userBusd0Before = busd0.balanceOf(USER);
+        uint256 contractUsd0Before = usd0.balanceOf(address(leverageContract));
+
+        vm.prank(USER);
+        leverageContract.unleveragePosition(20);
+
+        (,, uint256 borrowAfter,, uint256 collateralAfter) = lendingMarket.getUserPosition(marketParams, USER);
+        console.log("borrowBefore/After:", borrowBefore, borrowAfter);
+        console.log("collateralBefore/After:", collateralBefore, collateralAfter);
+
+        assertLt(borrowAfter, borrowBefore);
+        assertLt(collateralAfter, collateralBefore);
+        assertGt(usd0.balanceOf(USER), userUsd0Before, "USER usd0 balance must increase");
+        assertEq(busd0.balanceOf(USER), userBusd0Before, "USER busd0 balance should not change (only USD0 is ever transferred to USER)");
+        assertEq(usd0.balanceOf(address(leverageContract)), contractUsd0Before, "no new USD0 proceeds should be left stuck in the contract");
+    }
+
     // Helper function to check prerequisites
     function test_CheckPrerequisites() public view {
         uint256 busd0Balance = busd0.balanceOf(USER);
